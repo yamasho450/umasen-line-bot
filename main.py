@@ -29,20 +29,24 @@ def _short_race_title(raw: str) -> str:
         s = s.split("の", 1)[0].strip()
     return s
 
-def _extract_md_from_raw(raw: str):
-    """ '2月8日(日 )' みたいな表記から (month, day) を取り出す """
+def _extract_md(raw: str):
     m = re.search(r"(\d{1,2})月(\d{1,2})日", raw or "")
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
 
+def _extract_place_and_raceno(raw: str):
+    # 例: "2月8日(日 ) 東京11R ..." / "2月7日(土) 京都11R ..."
+    place = None
+    for p in ["東京", "京都", "小倉", "中山", "阪神", "中京", "新潟", "福島", "函館", "札幌"]:
+        if p in (raw or ""):
+            place = p
+            break
+    m = re.search(r"(\d{1,2})R", raw or "")
+    raceno = int(m.group(1)) if m else None
+    return place, raceno
+
 def get_today_races(limit=10):
-    """
-    return: [(name, slug, raw_text), ...]
-    name: 短い表示名（東京新聞杯(G3) 等）
-    slug: umasenのslug（tokyosinbunhai2026 等）
-    raw_text: 元のリンクテキスト（日時/場/レース番号が入ってる）
-    """
     url = "https://umasen.com/expect/"
     res = requests.get(url, headers=UA_HEADERS, timeout=10)
     if res.status_code != 200:
@@ -102,86 +106,75 @@ def get_umasen_marks(race_slug):
 
 
 # ==============================
-# netkeiba: 当日レース一覧から race_id を引き当て、オッズURLを作る
+# netkeiba: race_list_sub から race_id を拾う（安定版）
 # ==============================
-def _normalize_racename(s: str) -> str:
-    """照合用にレース名を軽く正規化"""
-    s = (s or "").strip()
-    s = re.sub(r"\s+", "", s)
-    s = s.replace("（", "(").replace("）", ")")
-    # 余計な語を除去（必要なら追加）
-    s = s.replace("予想", "")
-    return s
+PLACE_TO_ID = {
+    "札幌": "01",
+    "函館": "02",
+    "福島": "03",
+    "新潟": "04",
+    "東京": "05",
+    "中山": "06",
+    "中京": "07",
+    "京都": "08",
+    "阪神": "09",
+    "小倉": "10",
+}
 
-def get_netkeiba_race_map(yyyymmdd: str):
-    """
-    netkeibaのレース一覧ページから
-    { 正規化レース名: race_id } を作る
-    """
-    url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={yyyymmdd}"
+_netkeiba_cache = {}  # (yyyymmdd, place_id) -> {raceno:int: race_id}
+
+def get_netkeiba_raceid_by_raceno(yyyymmdd: str, place_id: str):
+    key = (yyyymmdd, place_id)
+    if key in _netkeiba_cache:
+        return _netkeiba_cache[key]
+
+    # race_list_sub はHTMLにリンクが載ることが多く、requestsでも拾いやすい
+    url = f"https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={yyyymmdd}&kaisai_place={place_id}"
     res = requests.get(url, headers=UA_HEADERS, timeout=10)
     if res.status_code != 200:
-        return None
+        _netkeiba_cache[key] = {}
+        return _netkeiba_cache[key]
 
     res.encoding = res.apparent_encoding
     soup = BeautifulSoup(res.text, "html.parser")
 
     mapping = {}
-
-    # ページ内のリンクから race_id= を含むものを拾う
-    for a in soup.select("a[href]"):
+    for a in soup.select("a[href*='race_id=']"):
         href = a.get("href") or ""
-        if "race_id=" not in href:
-            continue
+        text = a.get_text(strip=True)
 
-        # race_id抽出
+        # テキスト側から "11R" を拾う
+        m = re.search(r"(\d{1,2})R", text)
+        if not m:
+            continue
+        raceno = int(m.group(1))
+
+        # href から race_id を拾う
         try:
             q = urlparse(href).query
-            race_id = parse_qs(q).get("race_id", [None])[0]
-            if not race_id:
-                continue
+            rid = parse_qs(q).get("race_id", [None])[0]
         except Exception:
+            rid = None
+        if not rid:
             continue
 
-        title = a.get_text(strip=True)
-        if not title:
-            continue
+        # 最初に見つかったものを採用
+        mapping.setdefault(raceno, rid)
 
-        key = _normalize_racename(title)
-        if key and key not in mapping:
-            mapping[key] = race_id
+    _netkeiba_cache[key] = mapping
+    return mapping
 
-    return mapping if mapping else None
-
-def find_odds_url_for_race(umasen_name: str, yyyymmdd: str):
-    """
-    umasen側の短いレース名（例：東京新聞杯(G3)）から
-    netkeibaのrace_idを探してオッズURLを返す
-    """
-    race_map = get_netkeiba_race_map(yyyymmdd)
-    if not race_map:
+def build_odds_url(yyyymmdd: str, place: str, raceno: int):
+    place_id = PLACE_TO_ID.get(place)
+    if not place_id or not raceno:
         return None
 
-    key = _normalize_racename(umasen_name)
+    m = get_netkeiba_raceid_by_raceno(yyyymmdd, place_id)
+    rid = m.get(raceno)
+    if not rid:
+        return None
 
-    # まず完全一致
-    if key in race_map:
-        rid = race_map[key]
-        return f"https://race.netkeiba.com/odds/index.html?race_id={rid}"
-
-    # 次に「含む」マッチ（東京新聞杯 と 東京新聞杯(G3) の差など）
-    for k, rid in race_map.items():
-        if key and (key in k or k in key):
-            return f"https://race.netkeiba.com/odds/index.html?race_id={rid}"
-
-    # 最後に (G3) など括弧を落として再挑戦
-    key2 = re.sub(r"\(.*?\)", "", key)
-    for k, rid in race_map.items():
-        k2 = re.sub(r"\(.*?\)", "", k)
-        if key2 and (key2 in k2 or k2 in key2):
-            return f"https://race.netkeiba.com/odds/index.html?race_id={rid}"
-
-    return None
+    return f"https://race.netkeiba.com/odds/index.html?race_id={rid}"
 
 
 # ==============================
@@ -199,18 +192,9 @@ def reply_messages(reply_token, messages):
 def quick_reply_home():
     return {
         "items": [
-            {
-                "type": "action",
-                "action": {"type": "message", "label": "今日のレース", "text": "今日のレース"}
-            },
-            {
-                "type": "action",
-                "action": {"type": "message", "label": "レース情報へ", "text": "レース情報へ"}
-            },
-            {
-                "type": "action",
-                "action": {"type": "message", "label": "使い方", "text": "使い方"}
-            },
+            {"type": "action", "action": {"type": "message", "label": "今日のレース", "text": "今日のレース"}},
+            {"type": "action", "action": {"type": "message", "label": "レース情報へ", "text": "レース情報へ"}},
+            {"type": "action", "action": {"type": "message", "label": "使い方", "text": "使い方"}},
         ]
     }
 
@@ -222,9 +206,7 @@ def send_help(reply_token):
         "・スラッグ（例：tokyosinbunhai2026）を直接送ってもOK"
     )
     reply_messages(reply_token, [{
-        "type": "text",
-        "text": text,
-        "quickReply": quick_reply_home()
+        "type": "text", "text": text, "quickReply": quick_reply_home()
     }])
 
 def build_races_flex_for_marks(races):
@@ -236,7 +218,6 @@ def build_races_flex_for_marks(races):
             "height": "sm",
             "action": {"type": "postback", "label": name[:20], "data": f"race={slug}", "displayText": slug}
         })
-
     return {
         "type": "flex",
         "altText": "ウマセン 今日のレース一覧",
@@ -265,15 +246,10 @@ def send_today_races(reply_token):
             "quickReply": quick_reply_home()
         }])
         return
-
     flex = build_races_flex_for_marks(races)
     reply_messages(reply_token, [
         flex,
-        {
-            "type": "text",
-            "text": "※一覧に無い場合は、スラッグ（例：tokyosinbunhai2026）を直接送ってもOK",
-            "quickReply": quick_reply_home()
-        }
+        {"type": "text", "text": "※一覧に無い場合は、スラッグ（例：tokyosinbunhai2026）を直接送ってもOK", "quickReply": quick_reply_home()}
     ])
 
 def send_marks(reply_token, slug):
@@ -292,9 +268,6 @@ def send_marks(reply_token, slug):
         }])
 
 def build_odds_links_flex(items):
-    """
-    items: [(race_title, odds_url), ...]
-    """
     rows = []
     for title, url in items:
         rows.append({
@@ -303,7 +276,6 @@ def build_odds_links_flex(items):
             "height": "sm",
             "action": {"type": "uri", "label": title[:20], "uri": url}
         })
-
     return {
         "type": "flex",
         "altText": "netkeiba オッズリンク",
@@ -324,9 +296,6 @@ def build_odds_links_flex(items):
     }
 
 def send_race_info_links(reply_token):
-    """
-    ウマセンの今日一覧 → 各レースを netkeibaのオッズURLへリンク化して返す
-    """
     races = get_today_races(limit=10)
     if not races:
         reply_messages(reply_token, [{
@@ -336,29 +305,30 @@ def send_race_info_links(reply_token):
         }])
         return
 
-    # 日付（ウマセンのリンクテキストから月日を拾う。無ければ今日）
     jst = ZoneInfo("Asia/Tokyo")
     now = datetime.now(jst)
 
-    # レースごとに(YYYYMMDD)を推定（ほとんど同日だが土日混在もあるので）
     items = []
     for name, _slug, raw in races:
-        md = _extract_md_from_raw(raw)
+        md = _extract_md(raw)
         if md:
             m, d = md
-            y = now.year
-            yyyymmdd = f"{y:04d}{m:02d}{d:02d}"
+            yyyymmdd = f"{now.year:04d}{m:02d}{d:02d}"
         else:
             yyyymmdd = now.strftime("%Y%m%d")
 
-        odds_url = find_odds_url_for_race(name, yyyymmdd)
+        place, raceno = _extract_place_and_raceno(raw)
+        if not place or not raceno:
+            continue
+
+        odds_url = build_odds_url(yyyymmdd, place, raceno)
         if odds_url:
-            items.append((name, odds_url))
+            items.append((f"{place}{raceno}R {name}", odds_url))
 
     if not items:
         reply_messages(reply_token, [{
             "type": "text",
-            "text": "netkeiba側のリンク生成に失敗しました（レース名の一致が取れない可能性）。",
+            "text": "netkeiba側のリンク生成に失敗しました（開催日/競馬場/レース番号の一致が取れない可能性）。",
             "quickReply": quick_reply_home()
         }])
         return
@@ -366,11 +336,7 @@ def send_race_info_links(reply_token):
     flex = build_odds_links_flex(items[:10])
     reply_messages(reply_token, [
         flex,
-        {
-            "type": "text",
-            "text": "※リンクが足りない場合は、netkeibaの当日レース一覧から探してください。",
-            "quickReply": quick_reply_home()
-        }
+        {"type": "text", "text": "※リンクが無いレースはnetkeiba側で未掲載/取得失敗の可能性があります。", "quickReply": quick_reply_home()}
     ])
 
 
@@ -391,25 +357,17 @@ def callback():
 
         etype = event.get("type")
 
-        # ボタン（postback）
         if etype == "postback":
             data = (event.get("postback", {}) or {}).get("data", "")
-
             if data == "action=today":
-                send_today_races(reply_token)
-                continue
+                send_today_races(reply_token); continue
             if data == "action=help":
-                send_help(reply_token)
-                continue
+                send_help(reply_token); continue
             if data.startswith("race="):
                 slug = data.split("=", 1)[1].strip()
-                send_marks(reply_token, slug)
-                continue
+                send_marks(reply_token, slug); continue
+            send_help(reply_token); continue
 
-            send_help(reply_token)
-            continue
-
-        # テキスト（message）
         if etype == "message":
             message = event.get("message", {}) or {}
             if message.get("type") != "text":
@@ -423,18 +381,12 @@ def callback():
             text = (message.get("text") or "").strip()
 
             if text in ["今日のレース", "本日のレース", "一覧"]:
-                send_today_races(reply_token)
-                continue
-
+                send_today_races(reply_token); continue
             if text in ["レース情報へ", "レース情報", "オッズへ"]:
-                send_race_info_links(reply_token)
-                continue
-
+                send_race_info_links(reply_token); continue
             if text in ["使い方", "help", "ヘルプ"]:
-                send_help(reply_token)
-                continue
+                send_help(reply_token); continue
 
-            # それ以外はスラッグ扱い
             send_marks(reply_token, text)
             continue
 
@@ -443,9 +395,6 @@ def callback():
     return "OK", 200
 
 
-# ==============================
-# Render 起動
-# ==============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
