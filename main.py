@@ -5,7 +5,7 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-LINE_TOKEN = os.environ.get("LINE_TOKEN")
+LINE_TOKEN = (os.environ.get("LINE_TOKEN") or "").strip()
 MARKS = ["◎", "〇", "▲", "△", "★", "☆"]
 
 def get_umasen_marks(race_name):
