@@ -15,7 +15,8 @@ MARKS = ["◎", "〇", "▲", "△", "★", "☆"]
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0 Safari/537.36"
+                  "Chrome/120.0 Safari/537.36",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 }
 
 # ==============================
@@ -95,14 +96,16 @@ def get_umasen_marks(slug):
         name = row.select_one(".expect_uma_name")
         if not (mark and ban and name):
             continue
+
         m = mark.get_text(strip=True)
         if m in MARKS:
             out.append(f"{m} {ban.get_text(strip=True)} {name.get_text(strip=True)}")
+
     return out if out else None
 
 
 # ==============================
-# netkeiba：race_list_sub から race_id（重複防止）
+# netkeiba：race_list_sub から race_id を拾う（race_id末尾2桁=R番号方式）
 # ==============================
 PLACE_TO_ID = {
     "札幌": "01", "函館": "02", "福島": "03", "新潟": "04", "東京": "05",
@@ -119,6 +122,7 @@ def get_netkeiba_raceid_by_raceno(yyyymmdd: str, place_id: str):
     url = (f"https://race.netkeiba.com/top/race_list_sub.html"
            f"?kaisai_date={yyyymmdd}&kaisai_place={place_id}")
     res = requests.get(url, headers=UA_HEADERS, timeout=10)
+
     mapping = {}
     if res.status_code != 200:
         _netkeiba_cache[key] = mapping
@@ -127,26 +131,28 @@ def get_netkeiba_raceid_by_raceno(yyyymmdd: str, place_id: str):
     res.encoding = res.apparent_encoding
     soup = BeautifulSoup(res.text, "html.parser")
 
-    # ★ 重要：テキストが「◯R」だけのリンクのみ採用（重複防止）
+    # ★ 重要：race_idを拾って「末尾2桁＝R番号」で割り当てる（テキストに依存しない）
     for a in soup.select("a[href*='race_id=']"):
-        text = a.get_text(strip=True)
-        m = re.match(r"^(\d{1,2})R$", text)
-        if not m:
-            continue
-        raceno = int(m.group(1))
-
         href = a.get("href") or ""
         try:
             q = urlparse(href).query
             rid = parse_qs(q).get("race_id", [None])[0]
         except Exception:
             continue
+
         if not rid:
             continue
 
-        if raceno in mapping:
+        # race_id末尾2桁からR番号（01〜12）を推定
+        m = re.search(r"(\d{2})$", rid)
+        if not m:
             continue
-        mapping[raceno] = rid
+        raceno = int(m.group(1))
+        if not (1 <= raceno <= 12):
+            continue
+
+        # 同じRは最初に見つけたものを採用（重複リンクは無視）
+        mapping.setdefault(raceno, rid)
 
     _netkeiba_cache[key] = mapping
     return mapping
@@ -163,7 +169,7 @@ def build_odds_url(yyyymmdd: str, place: str, raceno: int):
 
 
 # ==============================
-# LINE 返信
+# LINE返信
 # ==============================
 def reply_messages(reply_token, messages):
     url = "https://api.line.me/v2/bot/message/reply"
@@ -242,9 +248,11 @@ def send_race_info_links(reply_token):
     for name, _, raw in races:
         md = _extract_md(raw)
         yyyymmdd = f"{now.year:04d}{md[0]:02d}{md[1]:02d}" if md else now.strftime("%Y%m%d")
+
         place, raceno = _extract_place_and_raceno(raw)
         if not place or not raceno:
             continue
+
         url = build_odds_url(yyyymmdd, place, raceno)
         if url:
             items.append((f"{place}{raceno}R {name}", url))
@@ -279,8 +287,11 @@ def callback():
         if e.get("type") == "message":
             msg = (e.get("message", {}) or {})
             if msg.get("type") != "text":
-                send_help(rt); continue
+                send_help(rt)
+                continue
+
             text = (msg.get("text") or "").strip()
+
             if text in ["今日のレース", "本日のレース", "一覧"]:
                 send_today_races(rt)
             elif text in ["レース情報へ", "レース情報", "オッズへ"]:
@@ -289,6 +300,7 @@ def callback():
                 send_help(rt)
             else:
                 send_marks(rt, text)
+
     return "OK", 200
 
 
