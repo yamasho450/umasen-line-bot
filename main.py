@@ -5,6 +5,7 @@ from flask import Flask, request, abort
 
 app = Flask(__name__)
 
+# Render の Environment Variables に設定する
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 
 # ==============================
@@ -13,12 +14,13 @@ LINE_TOKEN = os.environ.get("LINE_TOKEN")
 def get_umasen_marks(race_name):
     url = f"https://umasen.com/expect/{race_name}/"
     res = requests.get(url, timeout=10)
-    res.encoding = res.apparent_encoding
 
     if res.status_code != 200:
         return None
 
+    res.encoding = res.apparent_encoding
     soup = BeautifulSoup(res.text, "html.parser")
+
     results = []
 
     for row in soup.select("table tr"):
@@ -78,6 +80,9 @@ def callback():
     return "OK", 200
 
 
+# ==============================
+# Render 用 起動設定（超重要）
+# ==============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
